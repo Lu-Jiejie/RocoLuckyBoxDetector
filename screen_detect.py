@@ -65,7 +65,7 @@ def load_templates(template_dir: Path, sift: cv2.SIFT) -> list[Template]:
 
     templates: list[Template] = []
     for path in paths:
-        image = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+        image = cv2.imdecode(np.fromfile(str(path), dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
         if image is None:
             continue
         keypoints, descriptors = sift.detectAndCompute(image, None)
