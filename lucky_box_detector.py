@@ -61,6 +61,13 @@ class AccountState:
             return True
         return False
 
+    def unregister_hit(self) -> None:
+        if self.pity_progress > 0:
+            self.pity_progress -= 1
+        elif self.pity_cycles > 0:
+            self.pity_progress = PITY_LIMIT - 1
+            self.pity_cycles -= 1
+
 
 # ============================================================
 #  工具函数 & RegionSelector（已内置，不再依赖 box_detector_client）
@@ -1028,7 +1035,46 @@ class LuckyBoxWindow(QtWidgets.QMainWindow):
         else:
             btn.setEnabled(False)
         lo.addWidget(btn)
+
+        del_btn = QtWidgets.QPushButton("删除")
+        del_btn.setStyleSheet("QPushButton { color: #e74c3c; } QPushButton:hover { color: #c0392b; }")
+        del_btn.clicked.connect(lambda checked, r=record: self._delete_recording(r))
+        lo.addWidget(del_btn)
+
         return card
+
+    def _delete_recording(self, record: CaptureRecord) -> None:
+        reply = QtWidgets.QMessageBox.question(
+            self, "确认删除",
+            "确定要删除此录制吗？\n将同时删除本地文件和对应的保底进度。",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+        )
+        if reply != QtWidgets.QMessageBox.Yes:
+            return
+
+        # 1. 删除本地文件
+        path_str = record.gif_path or record.image_path
+        if path_str:
+            p = Path(path_str)
+            if p.is_file():
+                try:
+                    p.unlink()
+                except Exception:
+                    pass
+
+        # 2. 从 captures 列表中移除
+        if record in self._account.captures:
+            self._account.captures.remove(record)
+
+        # 3. 回退保底进度
+        self._account.unregister_hit()
+
+        # 4. 保存状态并刷新
+        self._save_state()
+        self._redraw_history()
+        self._refresh_pity_display()
+        if path_str:
+            self.lbl_status.setText(f"已删除 {Path(path_str).name}")
 
     # ---------- 配置持久化 ----------
     _DEFAULTS = {"threshold": 0.70, "offset": 2.5, "duration": 2.5}
