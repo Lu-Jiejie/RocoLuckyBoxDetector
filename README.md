@@ -54,5 +54,5 @@ python lucky_box_detector.py --template name.png --threshold 0.70
 
 ```bash
 pip install pyinstaller
-pyinstaller --onefile --noconsole --add-data "name.png;." lucky_box_detector.py
+pyinstaller lucky_box_detector.spec
 ```

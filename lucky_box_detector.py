@@ -363,19 +363,35 @@ class LuckyBoxWorker(threading.Thread):
                 name_bgr = self._crop(frame, self.name_roi) if self.name_roi else frame
                 box_bgr = self._crop(frame, self.box_roi) if self.box_roi else frame
 
-                # 盒子区按 24fps 塞环形缓冲区（post-trigger 阶段也不跳过）
+                # 盒子区按帧率塞环形缓冲区
                 now = time.perf_counter()
                 if now - last_cap >= 1.0 / GIF_FPS:
                     box_rgb = box_bgr[:, :, ::-1]
                     ring.push(PILImage.fromarray(box_rgb.copy()))
                     last_cap = now
 
-                # 消失后继续采集阶段（仍然塞帧到 ring，只跳过检测）
+                # 模板匹配检测名字（所有阶段都要检测）
+                found, score, _loc = self.detector.detect(name_bgr)
+
+                # 消失后偏移等待阶段：同时检测名字是否重新出现
                 if post_trigger_target > 0:
                     post_trigger_frames += 1
-                    if post_trigger_frames >= post_trigger_target:
+                    if found:
+                        # 名字在偏移期内重新出现 → 取消本次录制，重置状态
+                        msg = f"偏移等待中名字重新出现，取消录制 (score={score:.2f})"
+                        print(f"[worker] {msg}")
+                        self.event_queue.put(("status", msg))
+                        post_trigger_target = 0
+                        post_trigger_frames = 0
+                        absent_count = 0
+                        name_present = True
+                        ring.clear()
+                        ring = RingBuffer(maxlen=ring_max)
+                        last_cap = time.perf_counter()
+                    elif post_trigger_frames >= post_trigger_target:
+                        # 偏移期结束，名字未重新出现 → 保存 GIF
                         take = min(int(self.gif_duration * GIF_FPS), len(ring))
-                        print(f"[worker] post-trigger 结束, ring_len={len(ring)}, take={take}, saving GIF...")
+                        print(f"[worker] 偏移等待结束, ring_len={len(ring)}, take={take}, saving GIF...")
                         path = self._save_gif(ring, take)
                         if path:
                             record = CaptureRecord(
@@ -392,14 +408,11 @@ class LuckyBoxWorker(threading.Thread):
                         ring.clear()
                         ring = RingBuffer(maxlen=ring_max)
                         last_cap = time.perf_counter()
-                    # 跳过检测，但要等帧间隔
+                    # 跳过下方正常检测逻辑
                     left = self.interval_sec - (time.perf_counter() - t0)
                     if left > 0:
                         self._sleep(left)
                     continue
-
-                # 模板匹配检测名字
-                found, score, _loc = self.detector.detect(name_bgr)
 
                 if found:
                     absent_count = 0
@@ -562,7 +575,7 @@ class LuckyBoxWindow(QtWidgets.QMainWindow):
         h1.addStretch()
         root.addLayout(h1)
 
-        # 按钮行
+        # 按钮行 — 第一行：核心操作
         h2 = QtWidgets.QHBoxLayout()
         self.btn_name = QtWidgets.QPushButton("框选名字区域")
         self.btn_name.clicked.connect(lambda: self._select_roi("name"))
@@ -572,18 +585,41 @@ class LuckyBoxWindow(QtWidgets.QMainWindow):
         self.btn_box.clicked.connect(lambda: self._select_roi("box"))
         h2.addWidget(self.btn_box)
 
-        self.btn_v_name = QtWidgets.QPushButton("查看名字验证图")
-        self.btn_v_name.clicked.connect(lambda: self._open_verify("name"))
-        h2.addWidget(self.btn_v_name)
-
-        self.btn_v_box = QtWidgets.QPushButton("查看盒子验证图")
-        self.btn_v_box.clicked.connect(lambda: self._open_verify("box"))
-        h2.addWidget(self.btn_v_box)
+        h2.addSpacing(12)
 
         self.btn_toggle = QtWidgets.QPushButton("开始监控")
         self.btn_toggle.clicked.connect(self._toggle)
         h2.addWidget(self.btn_toggle)
+
+        h2.addStretch()
+
+        self.btn_github = QtWidgets.QPushButton("GitHub")
+        self.btn_github.clicked.connect(self._open_github)
+        h2.addWidget(self.btn_github)
         root.addLayout(h2)
+
+        # 按钮行 — 第二行：验证 / 参考
+        h2b = QtWidgets.QHBoxLayout()
+        self.btn_v_name = QtWidgets.QPushButton("查看名字验证图")
+        self.btn_v_name.clicked.connect(lambda: self._open_verify("name"))
+        h2b.addWidget(self.btn_v_name)
+
+        self.btn_v_box = QtWidgets.QPushButton("查看盒子验证图")
+        self.btn_v_box.clicked.connect(lambda: self._open_verify("box"))
+        h2b.addWidget(self.btn_v_box)
+
+        h2b.addSpacing(12)
+
+        self.btn_name_example = QtWidgets.QPushButton("名字示例")
+        self.btn_name_example.clicked.connect(lambda: self._open_example("name"))
+        h2b.addWidget(self.btn_name_example)
+
+        self.btn_box_example = QtWidgets.QPushButton("盒子示例")
+        self.btn_box_example.clicked.connect(lambda: self._open_example("box"))
+        h2b.addWidget(self.btn_box_example)
+
+        h2b.addStretch()
+        root.addLayout(h2b)
 
         # ROI 信息
         h3 = QtWidgets.QHBoxLayout()
@@ -655,6 +691,7 @@ class LuckyBoxWindow(QtWidgets.QMainWindow):
         pity_layout = QtWidgets.QVBoxLayout(pity_group)
         pity_layout.setSpacing(6)
 
+        # 保底信息 + 计数操作
         pity_info_row = QtWidgets.QHBoxLayout()
         self.lbl_pity_summary = QtWidgets.QLabel()
         self.lbl_pity_summary.setStyleSheet("font-size: 11pt; font-weight: bold;")
@@ -671,18 +708,21 @@ class LuckyBoxWindow(QtWidgets.QMainWindow):
         self.btn_edit_pity = QtWidgets.QPushButton("编辑保底计数")
         self.btn_edit_pity.clicked.connect(self._edit_pity)
         pity_info_row.addWidget(self.btn_edit_pity)
+        pity_layout.addLayout(pity_info_row)
 
+        # 清理操作
+        pity_clear_row = QtWidgets.QHBoxLayout()
+        pity_clear_row.addStretch()
         self.btn_clear_pity = QtWidgets.QPushButton("清除全部")
         self.btn_clear_pity.setStyleSheet("QPushButton { color: #d32f2f; }")
         self.btn_clear_pity.clicked.connect(self._clear_pity)
-        pity_info_row.addWidget(self.btn_clear_pity)
+        pity_clear_row.addWidget(self.btn_clear_pity)
 
         self.btn_clear_captures = QtWidgets.QPushButton("清空截图文件夹")
         self.btn_clear_captures.setStyleSheet("QPushButton { color: #d32f2f; }")
         self.btn_clear_captures.clicked.connect(self._clear_captures)
-        pity_info_row.addWidget(self.btn_clear_captures)
-
-        pity_layout.addLayout(pity_info_row)
+        pity_clear_row.addWidget(self.btn_clear_captures)
+        pity_layout.addLayout(pity_clear_row)
         root.addWidget(pity_group)
 
         # 最近 GIF
@@ -768,6 +808,22 @@ class LuckyBoxWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.information(self, "提示", f"尚未保存过{'名字' if which == 'name' else '盒子'}验证图。")
             return
         os.startfile(str(candidates[0]))
+
+    def _open_example(self, which: str) -> None:
+        """打开 bundled 的示例图（name_example.png / box_example.png）。"""
+        base = bundled_root()
+        fname = f"{which}_example.png"
+        p = base / "docs" / fname
+        if not p.exists():
+            p = base / fname
+        if not p.exists():
+            QtWidgets.QMessageBox.information(self, "提示", f"未找到示例图 {fname}")
+            return
+        os.startfile(str(p))
+
+    def _open_github(self) -> None:
+        import webbrowser
+        webbrowser.open("https://github.com/Lu-Jiejie/RocoLuckyBoxDetector")
 
     # ---------- 启停 ----------
     def _toggle(self) -> None:
