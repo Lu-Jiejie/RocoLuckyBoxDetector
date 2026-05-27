@@ -9,6 +9,7 @@ import threading
 import time
 import uuid
 from collections import deque
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
@@ -17,6 +18,48 @@ import numpy as np
 from PIL import Image as PILImage
 from PIL import ImageGrab
 from PyQt5 import QtCore, QtGui, QtWidgets
+
+
+# ============================================================
+#  保底计数
+# ============================================================
+
+PITY_LIMIT = 80
+
+
+@dataclass
+class CaptureRecord:
+    id: str
+    image_path: str
+    captured_at: str
+    locked_roi: tuple[int, int, int, int] | None = None
+    gif_path: str = ""
+
+    @property
+    def captured_dt(self) -> datetime:
+        return datetime.fromisoformat(self.captured_at)
+
+
+@dataclass
+class AccountState:
+    account_id: str
+    name: str
+    pity_progress: int = 0
+    pity_cycles: int = 0
+    captures: list[CaptureRecord] = field(default_factory=list)
+
+    @property
+    def remaining_to_pity(self) -> int:
+        return PITY_LIMIT - self.pity_progress
+
+    def register_hit(self, record: CaptureRecord) -> bool:
+        self.pity_progress += 1
+        self.captures.insert(0, record)
+        if self.pity_progress >= PITY_LIMIT:
+            self.pity_progress = 0
+            self.pity_cycles += 1
+            return True
+        return False
 
 
 # ============================================================
@@ -169,6 +212,22 @@ def resolve_config_path(base_dir: Path) -> Path:
         return fb
 
 
+def resolve_state_path(base_dir: Path) -> Path:
+    preferred = base_dir / "config" / "lucky_box_state.json"
+    try:
+        if not preferred.exists():
+            preferred.parent.mkdir(parents=True, exist_ok=True)
+            preferred.write_text("{}", encoding="utf-8")
+        return preferred
+    except Exception:
+        fb = _user_data_root() / "config" / "lucky_box_state.json"
+        fb.parent.mkdir(parents=True, exist_ok=True)
+        if not fb.exists():
+            fb.write_text("{}", encoding="utf-8")
+        print(f"[路径] 项目根目录不可写，状态已回退到 {fb}")
+        return fb
+
+
 def verify_dir() -> Path:
     """验证图存放于项目根目录下的 verify 文件夹，不可写时回退到用户目录。"""
     return _try_preferred_dir(app_root() / "verify", "verify")
@@ -312,7 +371,13 @@ class LuckyBoxWorker(threading.Thread):
                         print(f"[worker] post-trigger 结束, ring_len={len(ring)}, take={take}, saving GIF...")
                         path = self._save_gif(ring, take)
                         if path:
-                            self.event_queue.put(("capture", path))
+                            record = CaptureRecord(
+                                id=uuid.uuid4().hex,
+                                image_path=path,
+                                gif_path=path,
+                                captured_at=datetime.now().isoformat(timespec="seconds"),
+                            )
+                            self.event_queue.put(("capture", record))
                             print(f"[worker] GIF 已保存: {path}")
                         else:
                             print(f"[worker] GIF 保存失败 (ring_len={len(ring)})")
@@ -420,12 +485,14 @@ class LuckyBoxWindow(QtWidgets.QMainWindow):
         template_path: Path,
         storage_dir: Path,
         config_path: Path,
+        state_path: Path,
         match_threshold: float = 0.70,
     ):
         super().__init__()
         self.template_path = template_path
         self.storage_dir = storage_dir
         self.config_path = config_path
+        self.state_path = state_path
         self.match_threshold = match_threshold
 
         self.name_roi: tuple | None = None
@@ -433,8 +500,10 @@ class LuckyBoxWindow(QtWidgets.QMainWindow):
         self.detector = TemplateMatchDetector(template_path, threshold=match_threshold)
 
         self.event_queue: queue.Queue = queue.Queue()
-        self.capture_paths: list[str] = []
         self.monitoring = False
+
+        # 保底计数状态
+        self._account = self._load_state()
 
         self.setWindowTitle("幸运惊喜盒检测器")
         self.resize(860, 520)
@@ -467,6 +536,8 @@ class LuckyBoxWindow(QtWidgets.QMainWindow):
             self.lbl_status.setText("监控中 — 等待幸运惊喜盒出现...")
         else:
             self.worker.set_enabled(False)
+
+        self._refresh_pity_display()
 
     # ---------- UI 构建 ----------
     def _build_ui(self) -> None:
@@ -571,6 +642,41 @@ class LuckyBoxWindow(QtWidgets.QMainWindow):
 
         self._toggle_param_group(param_group, False)
         root.addWidget(param_group)
+
+        # ---- 保底计数面板 ----
+        pity_group = QtWidgets.QGroupBox("保底计数")
+        pity_layout = QtWidgets.QVBoxLayout(pity_group)
+        pity_layout.setSpacing(6)
+
+        pity_info_row = QtWidgets.QHBoxLayout()
+        self.lbl_pity_summary = QtWidgets.QLabel()
+        self.lbl_pity_summary.setStyleSheet("font-size: 11pt; font-weight: bold;")
+        pity_info_row.addWidget(self.lbl_pity_summary, 1)
+
+        self.btn_manual_hit = QtWidgets.QPushButton("手动命中 +1")
+        self.btn_manual_hit.clicked.connect(self._manual_hit)
+        pity_info_row.addWidget(self.btn_manual_hit)
+
+        self.btn_trigger_pity = QtWidgets.QPushButton("触发保底")
+        self.btn_trigger_pity.clicked.connect(self._trigger_pity)
+        pity_info_row.addWidget(self.btn_trigger_pity)
+
+        self.btn_edit_pity = QtWidgets.QPushButton("编辑保底计数")
+        self.btn_edit_pity.clicked.connect(self._edit_pity)
+        pity_info_row.addWidget(self.btn_edit_pity)
+
+        self.btn_clear_pity = QtWidgets.QPushButton("清除全部")
+        self.btn_clear_pity.setStyleSheet("QPushButton { color: #d32f2f; }")
+        self.btn_clear_pity.clicked.connect(self._clear_pity)
+        pity_info_row.addWidget(self.btn_clear_pity)
+
+        self.btn_clear_captures = QtWidgets.QPushButton("清空截图文件夹")
+        self.btn_clear_captures.setStyleSheet("QPushButton { color: #d32f2f; }")
+        self.btn_clear_captures.clicked.connect(self._clear_captures)
+        pity_info_row.addWidget(self.btn_clear_captures)
+
+        pity_layout.addLayout(pity_info_row)
+        root.addWidget(pity_group)
 
         # 最近 GIF
         self.lbl_last = QtWidgets.QLabel("")
@@ -686,12 +792,173 @@ class LuckyBoxWindow(QtWidgets.QMainWindow):
                     except Exception:
                         pass
             elif ev[0] == "capture":
-                p = ev[1]
-                self.capture_paths.insert(0, p)
+                record: CaptureRecord = ev[1]
+                self._account.register_hit(record)
+                self._refresh_pity_display()
+                self._save_state()
                 self._redraw_history()
                 self.lbl_last.setText(
-                    f'<a href="file:///{p}" style="color:#1a73e8;">最近: {Path(p).name}</a>'
+                    f'<a href="file:///{record.gif_path}" style="color:#1a73e8;">最近: {Path(record.gif_path).name}</a>'
                 )
+
+    # ---------- 保底计数 ----------
+    def _refresh_pity_display(self) -> None:
+        a = self._account
+        summary = (
+            f"保底进度 {a.pity_progress}/{PITY_LIMIT} | "
+            f"距保底 {a.remaining_to_pity} 次 | "
+            f"已触发保底 {a.pity_cycles} 次"
+        )
+        self.lbl_pity_summary.setText(summary)
+        if a.remaining_to_pity <= 10:
+            self.lbl_pity_summary.setStyleSheet("font-size: 11pt; font-weight: bold; color: #e74c3c;")
+        else:
+            self.lbl_pity_summary.setStyleSheet("font-size: 11pt; font-weight: bold;")
+
+    def _edit_pity(self) -> None:
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("编辑保底计数")
+        dialog.resize(300, 150)
+        layout = QtWidgets.QFormLayout(dialog)
+        layout.setSpacing(10)
+
+        spin_progress = QtWidgets.QSpinBox()
+        spin_progress.setRange(0, PITY_LIMIT - 1)
+        spin_progress.setValue(self._account.pity_progress)
+        layout.addRow("保底进度:", spin_progress)
+
+        spin_cycles = QtWidgets.QSpinBox()
+        spin_cycles.setRange(0, 9999)
+        spin_cycles.setValue(self._account.pity_cycles)
+        layout.addRow("保底次数:", spin_cycles)
+
+        btn_box = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        btn_box.accepted.connect(dialog.accept)
+        btn_box.rejected.connect(dialog.reject)
+        layout.addRow(btn_box)
+
+        if dialog.exec_() != QtWidgets.QDialog.Accepted:
+            return
+        self._account.pity_progress = spin_progress.value()
+        self._account.pity_cycles = spin_cycles.value()
+        self._refresh_pity_display()
+        self._save_state()
+        self.lbl_status.setText("保底计数已更新")
+
+    def _manual_hit(self) -> None:
+        record = CaptureRecord(
+            id=uuid.uuid4().hex,
+            image_path="",
+            gif_path="",
+            captured_at=datetime.now().isoformat(timespec="seconds"),
+        )
+        triggered = self._account.register_hit(record)
+        self._refresh_pity_display()
+        self._save_state()
+        self._redraw_history()
+        if triggered:
+            QtWidgets.QMessageBox.information(self, "保底触发", f"本轮第 {PITY_LIMIT} 次！保底已触发！")
+            self.lbl_status.setText(f"保底触发！累计 {self._account.pity_cycles} 次保底")
+        else:
+            self.lbl_status.setText("手动命中 +1")
+
+    def _trigger_pity(self) -> None:
+        reply = QtWidgets.QMessageBox.question(
+            self, "确认触发保底",
+            f"确定要手动触发一次保底吗？\n当前: 保底进度 {self._account.pity_progress}/{PITY_LIMIT}，{self._account.pity_cycles} 次保底",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+        )
+        if reply != QtWidgets.QMessageBox.Yes:
+            return
+        self._account.pity_cycles += 1
+        self._refresh_pity_display()
+        self._save_state()
+        self.lbl_status.setText(f"手动触发保底，当前累计 {self._account.pity_cycles} 次保底")
+
+    def _clear_pity(self) -> None:
+        reply = QtWidgets.QMessageBox.question(
+            self, "确认清除",
+            f"确定要清除全部保底计数吗？\n当前: 保底进度 {self._account.pity_progress}/{PITY_LIMIT}，保底 {self._account.pity_cycles} 次",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+        )
+        if reply == QtWidgets.QMessageBox.Yes:
+            self._account = AccountState(account_id="default", name="默认")
+            self._refresh_pity_display()
+            self._save_state()
+            self._redraw_history()
+            self.lbl_status.setText("保底计数已清除")
+
+    def _clear_captures(self) -> None:
+        reply = QtWidgets.QMessageBox.question(
+            self, "确认清空",
+            f"确定要删除 captures 文件夹中的所有文件吗？\n此操作不可恢复。",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+        )
+        if reply != QtWidgets.QMessageBox.Yes:
+            return
+        import shutil
+        deleted = 0
+        if self.storage_dir.exists():
+            for f in self.storage_dir.iterdir():
+                try:
+                    if f.is_file():
+                        f.unlink()
+                        deleted += 1
+                    elif f.is_dir():
+                        shutil.rmtree(f)
+                        deleted += 1
+                except Exception:
+                    pass
+        self._account.captures.clear()
+        self._save_state()
+        self._redraw_history()
+        self.lbl_last.setText("")
+        self.lbl_status.setText(f"已清空 captures，删除 {deleted} 个文件/文件夹")
+
+    def _load_state(self) -> AccountState:
+        if self.state_path.exists():
+            try:
+                data = json.loads(self.state_path.read_text(encoding="utf-8"))
+                acc = AccountState(
+                    account_id=data.get("account_id", "default"),
+                    name=data.get("name", "默认"),
+                    pity_progress=data.get("pity_progress", data.get("total_hits", 0)),
+                    pity_cycles=data.get("pity_cycles", 0),
+                )
+                for c in data.get("captures", []):
+                    acc.captures.append(CaptureRecord(
+                        id=c.get("id", ""),
+                        image_path=c.get("image_path", ""),
+                        gif_path=c.get("gif_path", ""),
+                        captured_at=c.get("captured_at", ""),
+                    ))
+                return acc
+            except Exception:
+                pass
+        return AccountState(account_id="default", name="默认")
+
+    def _save_state(self) -> None:
+        a = self._account
+        data = {
+            "account_id": a.account_id,
+            "name": a.name,
+            "pity_progress": a.pity_progress,
+            "pity_cycles": a.pity_cycles,
+            "captures": [
+                {
+                    "id": c.id,
+                    "image_path": c.image_path,
+                    "gif_path": c.gif_path,
+                    "captured_at": c.captured_at,
+                }
+                for c in a.captures[:200]
+            ],
+            "saved_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        try:
+            self.state_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
 
     # ---------- 历史缩略图 ----------
     def _redraw_history(self) -> None:
@@ -700,16 +967,20 @@ class LuckyBoxWindow(QtWidgets.QMainWindow):
             w = it.widget()
             if w:
                 w.deleteLater()
-        if not self.capture_paths:
+        captures = [c for c in self._account.captures if c.gif_path or c.image_path]
+        if not captures:
             empty = QtWidgets.QLabel("暂无录制记录")
             empty.setAlignment(QtCore.Qt.AlignCenter)
             empty.setStyleSheet("padding: 36px; color: #666;")
             self._history_grid.addWidget(empty, 0, 0)
             return
-        for i, ps in enumerate(self.capture_paths[:30]):
-            self._history_grid.addWidget(self._card(Path(ps)), i // 6, i % 6)
+        for i, c in enumerate(captures[:30]):
+            self._history_grid.addWidget(self._card(c), i // 6, i % 6)
 
-    def _card(self, path: Path) -> QtWidgets.QFrame:
+    def _card(self, record: CaptureRecord) -> QtWidgets.QFrame:
+        path_str = record.gif_path or record.image_path
+        path = Path(path_str) if path_str else None
+        has_file = path is not None and path.is_file()
         card = QtWidgets.QFrame()
         card.setFrameShape(QtWidgets.QFrame.StyledPanel)
         card.setStyleSheet("QFrame { border: 1px solid #d9d9d9; border-radius: 8px; background: white; }")
@@ -722,32 +993,40 @@ class LuckyBoxWindow(QtWidgets.QMainWindow):
         thumb.setFixedSize(166, 112)
         thumb.setAlignment(QtCore.Qt.AlignCenter)
         thumb.setStyleSheet("background: #f5f5f5; border: none;")
-        if path.suffix == ".gif":
-            mv = QtGui.QMovie(str(path))
-            mv.setScaledSize(QtCore.QSize(166, 112))
-            thumb.setMovie(mv)
-            mv.start()
+        if has_file:
+            if path.suffix == ".gif":
+                mv = QtGui.QMovie(str(path))
+                mv.setScaledSize(QtCore.QSize(166, 112))
+                thumb.setMovie(mv)
+                mv.start()
+            else:
+                px = QtGui.QPixmap(str(path))
+                if not px.isNull():
+                    thumb.setPixmap(px.scaled(166, 112, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation))
+                else:
+                    thumb.setText("(图片无效)")
         else:
-            px = QtGui.QPixmap(str(path))
-            thumb.setPixmap(px.scaled(166, 112, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation))
+            thumb.setText("(手动记录)")
         lo.addWidget(thumb, 0, QtCore.Qt.AlignHCenter)
 
-        nm = QtWidgets.QLabel(path.name)
+        nm = QtWidgets.QLabel(path.name if has_file else "(手动记录)")
         nm.setWordWrap(True)
         nm.setFixedWidth(166)
         nm.setAlignment(QtCore.Qt.AlignCenter)
         nm.setStyleSheet("font-size: 9pt; color: #555; border: none;")
         lo.addWidget(nm)
 
-        # 从文件名提取时间戳并显示
-        ts_label = QtWidgets.QLabel(_format_file_ts(path.stem))
+        ts_label = QtWidgets.QLabel(_format_file_ts(path.stem) if has_file else "")
         ts_label.setFixedWidth(166)
         ts_label.setAlignment(QtCore.Qt.AlignCenter)
         ts_label.setStyleSheet("font-size: 8pt; color: #999; border: none;")
         lo.addWidget(ts_label)
 
         btn = QtWidgets.QPushButton("打开")
-        btn.clicked.connect(lambda checked, p=str(path): os.startfile(p))
+        if has_file:
+            btn.clicked.connect(lambda checked, p=str(path): os.startfile(p))
+        else:
+            btn.setEnabled(False)
         lo.addWidget(btn)
         return card
 
@@ -880,6 +1159,7 @@ def main() -> int:
         template_path=tpl,
         storage_dir=resolve_storage_dir(base),
         config_path=resolve_config_path(base),
+        state_path=resolve_state_path(base),
         match_threshold=args.threshold,
     )
     win.show()
