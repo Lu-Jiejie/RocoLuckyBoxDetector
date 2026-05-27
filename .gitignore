@@ -3,4 +3,3 @@ verify
 dist
 captures
 build
-*.spec
